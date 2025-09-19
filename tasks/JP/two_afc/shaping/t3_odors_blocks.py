@@ -1,26 +1,37 @@
 import pyControl.utility as pc
-from hardware_definition import right_port, left_port, center_port, final_valve, odor_A, odor_B
+from hardware_definition import right_port, left_port, center_port, final_valve, odor_A, odor_B, thermistor_sync
 
+import micropython
+micropython.alloc_emergency_exception_buf(1000)
 
 # Rwd sizing
-# For rwd durn multplier of 1, 1 mL ~ 125 rewards.
-# For rwd durn multiplier of 0.75, ~ 225 rewards.
-pc.v.reward_duration_multiplier = 0.75
-pc.v.n_allowed_rwds = 225  # total per session
+pc.v.reward_duration_multiplier = 0.8
+pc.v.n_allowed_rwds = 250  # total per session
+pc.v.reward_durations = [30, 30]  # Reward delivery duration (ms) [left, right].
 
 
-############
-# New code for task 3
-############
+# Shaping vars
+pc.v.required_center_hold_duration = 225  # target: 300
+pc.v.n_allowed_rwds_per_block = 0  # just initializing; will be updated before run start
+
+pc.v.ITI_duration = 1 * pc.second  # 1.5 Inter trial interval duration. Ensure this is longer than final valve flush duration.
+pc.v.timeout_duration = 1.5 * pc.second  # 2 timeout for wrong trials (in addition to ITI)
+
+pc.v.min_nose_out_duration = 0.5 * pc.second  # 0.75 how long ms has to be NOT in center port to initiate a new trial
+pc.v.early_error_buffer_time = 300  # 300 ms
+
+# Rewards-per-block function
+# CHANGE ME based on demands of shaping
+def get_n_rwds_allowed_in_block():
+    # pc.v.n_allowed_rwds_per_block = 10  # initial high value for shaping (Day 1)
+    # pc.v.n_allowed_rwds_per_block = 7  # Day 2
+    # pc.v.n_allowed_rwds_per_block = 5  # Day 3
+    # pc.v.n_allowed_rwds_per_block = 2 if pc.withprob(0.5) else 3  # Day 4
+    pc.v.n_allowed_rwds_per_block = 2 if pc.withprob(0.5) else (1 if pc.withprob(0.5) else 3)  # Day 5
+
 
 # Additional vars for blocks
-pc.v.n_allowed_rwds_per_block = 3
 pc.v.n_rewards_in_block = 0  # per-block counter
-pc.v.rewarded_side = "left" if pc.random() > 0.5 else "right"
-
-def get_n_rwds_allowed_in_block():
-    pc.v.n_allowed_rwds_per_block = 2 if pc.withprob(0.5) else (1 if pc.withprob(0.5) else 3)
-
 
 # Re-define these functions here to produce odor behavior
 def set_odor_valves():
@@ -39,6 +50,7 @@ def disable_odor_valves():
 
 def do_other_ITI_logic():
     check_update_rewarded_side()
+    pc.publish_event("set_odor_valves_for_trial")
 
 
 def check_update_rewarded_side():
@@ -60,31 +72,34 @@ def is_rewarded(side):
     pc.v.ave_correct_tracker.add(pc.v.outcome)
     return pc.v.outcome
 
+def clip(value, min_value, max_value):
+    return min(max(value, min_value), max_value)
+
 ############
 # All code below here is direct c/p from task 2, save for a few small changes (ie printing more vars)
 ############
 
 # State machine
 states = ["wait_for_center_poke", "deliver_odor", "wait_for_side_poke", "left_reward", "right_reward", "inter_trial_interval", "timeout"]
-events = ["center_poke", "right_poke", "left_poke", "center_poke_out", "right_poke_out", "left_poke_out", "session_timer", "finish_ITI", "close_final_valve", "center_poke_held"]
+events = ["center_poke", "right_poke", "left_poke", "center_poke_out", "right_poke_out", "left_poke_out", "session_timer", "finish_ITI", "close_final_valve", "close_final_valve_done", "center_poke_held", "set_odor_valves_for_trial", "therm_sync_ON"]
 initial_state = "wait_for_center_poke"
 
 # Odor parameters
-pc.v.required_center_hold_duration = 300  # ms
 pc.v.odor_delivery_duration = 500
-pc.v.final_valve_flush_duration = 500
+pc.v.final_valve_flush_duration = 500  # ensure this is shorter than the ITI
 
 # General Parameters.
 pc.v.session_duration = 1 * pc.hour  # Session duration.
-pc.v.reward_durations = [47, 54]  # Reward delivery duration (ms) [left, right].
+pc.v.rewarded_side = "left" if (pc.random() > 0.5) else "right"
 
-pc.v.ITI_duration = 1.5 * pc.second  # Inter trial interval duration.
-pc.v.timeout_duration = 2 * pc.second  # timeout for wrong trials (in addition to ITI)
 
 # Variables.
 pc.v.entry_time = 0
+pc.v.exit_time = 0
 pc.v.n_total_trials = 0
+pc.v.n_early_errors = 0
 pc.v.mov_ave_correct = 0  # moving avg of last 10 trials
+pc.v.overall_ave_correct = 0  # excludes early errs
 
 # Reward variables (updated / used in "is_rewarded")
 pc.v.choice = "right"
@@ -98,6 +113,8 @@ pc.v.ave_correct_tracker = pc.OnlineMovingAverage(10)
 def run_start():
     # Set session timer and turn on houslight.
     pc.set_timer("session_timer", pc.v.session_duration)
+    pc.publish_event("set_odor_valves_for_trial")
+    get_n_rwds_allowed_in_block()
 
 def run_end():
     # Turn off all hardware outputs.
@@ -115,28 +132,41 @@ def all_states(event):
     # When 'session_timer' event occurs stop framework to end session.
     if event == "session_timer":
         pc.stop_framework()
+
+    # End flushing of final valve
     elif event == "close_final_valve":
         final_valve.off()
+
+    # After new trial's odor is selected in ITI, set the odor valves
+    # so there is enough time for the odor to flow thru the tubes.
+    # Importantly, we make sure the final valve is closed (200 ms
+    # after the "off" command [just picked this number arbitrarily, could time it])
+    # so that the next trial's odor doesn't accidentally leak out.
+    elif event == "set_odor_valves_for_trial":
+        if pc.timer_remaining("close_final_valve_done") == 0:
+            set_odor_valves()
+        else:
+            pc.set_timer("set_odor_valves_for_trial", 100)
 
 
 ### State-machine ###
 
 def wait_for_center_poke(event):
-  
-    # Cue mouse that trial is available
+
     if event == "entry":
-        center_port.LED.on()
-        pc.v.entry_time = pc.get_current_time()  # Start early-error buffer
-        set_odor_valves()
+        center_port.LED.on()  # cues mouse that trial is available
+        pc.v.entry_time = pc.get_current_time()  # start early-error buffer
+        # set_odor_valves()  # replaced by all_states logic
     
     # If mouse pokes either side port *after* the early-error buffer
     # has elapsed, then timeout and restart the trial.
     elif (
-        ((pc.get_current_time() - pc.v.entry_time) > 300)
+        ((pc.get_current_time() - pc.v.entry_time) > pc.v.early_error_buffer_time)
         and (event == "left_poke" or event == "right_poke")
     ):
         center_port.LED.off()
         disable_odor_valves()
+        pc.v.n_early_errors += 1
         pc.goto_state("timeout")
 
     # If ms is still licking at reward port, then restart the 
@@ -154,15 +184,15 @@ def wait_for_center_poke(event):
         pc.goto_state("deliver_odor")
 
 
-# Just air in this shaping task
 def deliver_odor(event):
     if event == "entry":
-        center_port.LED.off()
-        final_valve.on()
+        center_port.LED.off()  # the light turning off will cue the mouse to the timing of odor delivery
+        final_valve.on()  # delivers the odor!
         pc.timed_goto_state("wait_for_side_poke", pc.v.odor_delivery_duration)
     elif event == "exit":
-        pc.set_timer("close_final_valve", (pc.v.final_valve_flush_duration))
-        disable_odor_valves()
+        disable_odor_valves()  # close the odor valves to allow final valve to flush w clean air
+        pc.set_timer("close_final_valve", (pc.v.final_valve_flush_duration))  # this will close the final valve after flush
+        pc.set_timer("close_final_valve_done", (pc.v.final_valve_flush_duration + 200))  # this allows buffer time for final valve to close before switching odor valves on again
 
 
 def wait_for_side_poke(event):
@@ -199,7 +229,6 @@ def right_reward(event):
 
 def timeout(event):
     if event == "entry":
-        pc.v.ave_correct_tracker.add(0)
         pc.timed_goto_state("inter_trial_interval", pc.v.timeout_duration)
 
 
@@ -215,10 +244,11 @@ def inter_trial_interval(event):
         pc.v.entry_time = pc.get_current_time()
 
         # Update vars
-        pc.v.mov_ave_correct = pc.v.ave_correct_tracker.ave
         pc.v.n_total_trials += 1
-        pc.print_variables(["n_total_trials", "n_correct_trials", "mov_ave_correct", "required_center_hold_duration", "rewarded_side"])
-        
+        pc.v.mov_ave_correct = pc.v.ave_correct_tracker.ave
+        pc.v.overall_ave_correct = pc.v.n_correct_trials / max(pc.v.n_total_trials - pc.v.n_early_errors, 1)
+        pc.print_variables(["n_total_trials", "n_correct_trials", "n_early_errors", "mov_ave_correct", "overall_ave_correct", "rewarded_side", "choice", "outcome"])
+
         # Auto-increase center hold duration for shaping
         if (
             ((pc.v.n_rewards == 25) or (pc.v.n_rewards == 50))
@@ -227,22 +257,37 @@ def inter_trial_interval(event):
             pc.v.required_center_hold_duration += 75
 
         # Do any other required ITI logic in this function
+        # (ie choose rewarded side for next trial)
         do_other_ITI_logic()
     
     # If mouse is still licking the reward, let it keep going until it's done.
-    elif (
-        pc.v.outcome
-        and (
-                ((event == "left_poke") and pc.v.choice == "left")
-                or ((event == "right_poke") and pc.v.choice == "right")
-            )
-        and ((pc.get_current_time() - pc.v.entry_time) < (pc.v.ITI_duration/2))
-    ):
-        pc.reset_timer("finish_ITI", pc.v.ITI_duration)
+    # elif (
+    #     pc.v.outcome
+    #     and (
+    #             ((event == "left_poke") and pc.v.choice == "left")
+    #             or ((event == "right_poke") and pc.v.choice == "right")
+    #         )
+    #     and ((pc.get_current_time() - pc.v.entry_time) < (pc.v.ITI_duration/2))
+    # ):
+    #     pc.reset_timer("finish_ITI", pc.v.ITI_duration)
 
+    # Once ITI finishes, and mouse's nose is out of center port,
+    # and has been out for at least min_nose_out_duration,
+    # go to first state again.
     elif event == "finish_ITI":
-        pc.goto_state("wait_for_center_poke")
+        if  (
+            ((pc.get_current_time() - pc.v.exit_time) > pc.v.min_nose_out_duration)
+            and (not center_port.value())
+        ):
+            pc.goto_state("wait_for_center_poke")
+        else:
+            pc.set_timer("finish_ITI", 100)
+
+    elif event == "center_poke_out":
+        pc.v.exit_time = pc.get_current_time()
     
+    # Check if we need to stop task for any reason.
     elif event == "exit":
         if pc.v.n_rewards >= pc.v.n_allowed_rwds:
+            # TODO: send a text??
             pc.stop_framework()

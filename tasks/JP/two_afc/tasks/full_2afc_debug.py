@@ -1,11 +1,19 @@
 import pyControl.utility as pc
 from hardware_definition import right_port, left_port, center_port, final_valve, odor_A, odor_B, thermistor_sync
 
+import micropython
+micropython.alloc_emergency_exception_buf(1000)
+
+### DO NOT USE FOR BEHAVIOR -- TIMINGS REDUCED FOR CONVENIENT DEBUGGING ###
+
+### DO NOT USE FOR BEHAVIOR -- TIMINGS REDUCED FOR CONVENIENT DEBUGGING ###
+
+### DO NOT USE FOR BEHAVIOR -- TIMINGS REDUCED FOR CONVENIENT DEBUGGING ###
 
 # Rwd sizing
 # For rwd durn multplier of 1, 1 mL ~ 125 rewards.
 # For rwd durn multiplier of 0.75, ~ 225 rewards.
-pc.v.reward_duration_multiplier = 0.8
+pc.v.reward_duration_multiplier = 0.01
 pc.v.n_allowed_rwds = 300  # total per session
 pc.v.reward_durations = [30, 30]  # Reward delivery duration (ms) [left, right].
 
@@ -62,13 +70,13 @@ def clip(value, min_value, max_value):
 
 # State machine
 states = ["wait_for_center_poke", "deliver_odor", "wait_for_side_poke", "left_reward", "right_reward", "inter_trial_interval", "timeout"]
-events = ["center_poke", "right_poke", "left_poke", "center_poke_out", "right_poke_out", "left_poke_out", "session_timer", "finish_ITI", "close_final_valve", "close_final_valve_done", "center_poke_held", "set_odor_valves_for_trial", "therm_sync_ON"]
+events = ["center_poke", "right_poke", "left_poke", "center_poke_out", "right_poke_out", "left_poke_out", "session_timer", "finish_ITI", "close_final_valve", "close_final_valve_done", "center_poke_held", "set_odor_valves_for_trial"]
 initial_state = "wait_for_center_poke"
 
 # Odor parameters
-pc.v.required_center_hold_duration = 300  # ms. Currently, this is ~ the absolute minimum time the current trial's odor will have to fill the tube before the final valve.
-pc.v.odor_delivery_duration = 500
-pc.v.final_valve_flush_duration = 500  # ensure this is shorter than the ITI
+pc.v.required_center_hold_duration = 100  # ms. Currently, this is ~ the absolute minimum time the current trial's odor will have to fill the tube before the final valve.
+pc.v.odor_delivery_duration = 100
+pc.v.final_valve_flush_duration = 10  # ensure this is shorter than the ITI
 
 # General Parameters.
 pc.v.session_duration = 1 * pc.hour  # Session duration.
@@ -79,8 +87,8 @@ pc.v.ITI_duration_mu = 1.5 * pc.second
 pc.v.ITI_duration_sig = 0.75 * pc.second
 pc.v.ITI_duration_min = 1 * pc.second 
 pc.v.ITI_duration_max = 5 * pc.second 
-pc.v.timeout_duration = 2.0 * pc.second  # timeout for wrong trials (in addition to ITI)
-pc.v.min_nose_out_duration = 0.75 * pc.second
+pc.v.timeout_duration = 0.1 * pc.second  # timeout for wrong trials (in addition to ITI)
+pc.v.min_nose_out_duration = 0.25 * pc.second
 pc.v.early_error_buffer_time = 300  # ms
 
 # Variables.
@@ -141,6 +149,7 @@ def all_states(event):
 ### State-machine ###
 
 def wait_for_center_poke(event):
+    # pc.print(str(center_port.value()))
 
     if event == "entry":
         center_port.LED.on()  # cues mouse that trial is available
@@ -225,14 +234,15 @@ def inter_trial_interval(event):
     if event == "entry":
 
         # Determine ITI for this trial 
-        pc.v.ITI_duration = clip(
-            pc.gauss_rand(
-                pc.v.ITI_duration_mu,
-                pc.v.ITI_duration_sig
-            ),
-            pc.v.ITI_duration_min,
-            pc.v.ITI_duration_max
-        )
+        # pc.v.ITI_duration = clip(
+        #     pc.gauss_rand(
+        #         pc.v.ITI_duration_mu,
+        #         pc.v.ITI_duration_sig
+        #     ),
+        #     pc.v.ITI_duration_min,
+        #     pc.v.ITI_duration_max
+        # )
+        pc.v.ITI_duration = 1000
 
         # Start ITI timer. Using a timer instead of "timed_goto_state()"
         # allows us to reset the timer if necessary, instead of restarting
@@ -272,6 +282,8 @@ def inter_trial_interval(event):
         ):
             pc.goto_state("wait_for_center_poke")
         else:
+            # pc.print(str(((pc.get_current_time() - pc.v.exit_time) > pc.v.min_nose_out_duration)))
+            # pc.print(str((not center_port.value())))
             pc.set_timer("finish_ITI", 100)
 
     elif event == "center_poke_out":
